@@ -254,8 +254,8 @@ function(glad_add_library TARGET)
     endif()
 
     set(GLAD_LANGUAGE "c")
-    if(DEFINED GG_LANGUAGE)
-        string(TOLOWER "${GG_LANGUAGE}" "${GLAD_LANGUAGE}")
+    if(GG_LANGUAGE)
+        string(TOLOWER "${GG_LANGUAGE}" GLAD_LANGUAGE)
     endif()
 
     if(GLAD_LANGUAGE STREQUAL "c")
