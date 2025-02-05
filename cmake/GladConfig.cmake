@@ -178,7 +178,7 @@ function(__glad_c_library CARGS CFILES)
 endfunction()
 
 function(__glad_fortran_library FARGS FFILES)
-    cmake_parse_arguments(GGF "" "" "API" ${ARGC})
+    cmake_parse_arguments(GGF "" "" "API" ${ARGN})
 
     if(NOT GGF_API)
         message(FATAL_ERROR "Need API")
