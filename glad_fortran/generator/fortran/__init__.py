@@ -533,8 +533,8 @@ class FortranGenerator(JinjaGenerator):
 
     def get_templates(self, spec, feature_set, config):
         return [
-            ('base_template.F90', 'glad-{}/src/{}.F90'.format(feature_set.name, spec.name)),
-            ('types.h', 'glad-{}/include/glad/types.h'.format(feature_set.name))
+            ('base_template.F90', 'src/{}.F90'.format(feature_set.name, spec.name)),
+            ('types.h', 'include/glad/types.h'.format(feature_set.name))
         ]
 
     def modify_feature_set(self, spec, feature_set, config):
