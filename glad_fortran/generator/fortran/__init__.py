@@ -1,3 +1,4 @@
+import re
 import jinja2
 
 import glad
@@ -12,7 +13,7 @@ from glad.generator.util import (
 from glad.parse import ParsedType, EnumType
 from glad.sink import LoggingSink
 
-_FORTRAN_COMMON_C_TYPES = {
+_FORTRAN_TYPE_MAPPING = {
 #    'void': 'c_void',
     'char': 'c_char',
     'uchar': 'c_char',
@@ -78,27 +79,19 @@ _CHAR_KINDS = (
     'c_char'
 )
 
+
 def enum_type_kind(enum, feature_set):
+    # Hex constant
     if enum.value.startswith('0x'):
         return 'c_int64_t' if len(enum.value[2:]) > 8 else 'c_int'
-    elif enum.name in ('GL_TRUE', 'GL_FALSE'):
+    # GL bool constant
+    elif enum.name in ['GL_TRUE', 'GL_FALSE']:
         return 'c_signed_char'
-    elif enum.value.startswith('-'):
+    # Integer number
+    elif enum.value.lstrip('+-').isdigit():
         return 'c_int'
-    elif enum.value.endswith('f') or enum.value.endswith('F'):
-        return 'c_float'
-    elif enum.value.startswith('"'):
-        return 'c_char'
-    elif enum.value.startswith('(('):
-        # Casts: '((Type)value)' -> 'Type'
-        raise NotImplementedError
-    elif enum.value.startswith('EGL_CAST'):
-        # EGL_CAST(type,value) -> type
-        raise NotImplementedError
-    elif enum.type:
-        return _FORTRAN_TYPE_MAPPING.get(enum.type, 'c_int')
     else:
-        return 'c_int'
+        return NotImplementedError(f'Unhandled enumeration type kind: {enum.name} = {enum.value}')
 
 
 def enum_type(enum, feature_set):
@@ -111,286 +104,323 @@ def enum_type(enum, feature_set):
     elif kind in _CHAR_KINDS:
         return 'character(len=*,kind={})'.format(kind)
     else:
-        return 'integer(kind=c_int)'
+        raise RuntimeError(f'Unknown enumeration type for kind: {kind}')
 
 
 def enum_value(enum, feature_set):
     kind = enum_type_kind(enum, feature_set)
     value = enum.value
 
-    if value.startswith('0x'):
-        return 'int(Z\'{}\', kind={})'\
-               .format('0'*((16 if len(value[2:]) > 8 else 8) - len(value[2:])) + value[2:], kind)
-
-    if kind in _REAL_KINDS:
-        # remove trailing 'f'/'F'
-        value = value[:-1]
-
-    # TODO bitwise not (~)
-    for old, new in (('(', ''), (')', ''),
-                     ('U', ''), ('L', '')):
-        value = value.replace(old, new)
-
-    return value
-
-
-def proc_type(command):
-    if is_returning(command):
-        return 'function'
+    if kind in _INT_KINDS:
+        if value.startswith('0x'):
+            boz_size = 16 if len(value[2:]) > 8 else 8 # number of hex digits for int64 or int32
+            boz_value = value[2:].zfill(boz_size)
+            return f'int(Z\'{boz_value}\', kind={kind})'
+        else:
+            # Remove decorative characters
+            # TODO bitwise not (~)
+            return re.sub(r'[()UL]', '', value)
     else:
-        return 'subroutine'
+        raise RuntimeError(f'Unknown enumeration value for kind: {kind} and {value}')
 
 
-def return_type_interface(command):
+def interface_return_type(command):
     type_ = command.proto.ret
 
-    if type_ is None:
-        raise NotImplementedError
+    parsed_type = get_parsed_type(type_)
 
-    parsed_type = type_ if isinstance(type_, ParsedType) else ParsedType.from_string(type_)
+    # Sanity check
+    if (parsed_type.is_pointer > 2) or \
+       (is_void(parsed_type) and not parsed_type.is_pointer):
+        raise NotImplementedError(f'Unhandled or void return type')
 
-    if not parsed_type.is_pointer and is_void(parsed_type):
-        raise NotImplementedError
-
-    if parsed_type.is_pointer > 2:
-        raise NotImplementedError
-
+    # This should be straightforward for C interfaces
     if parsed_type.is_pointer > 0 or \
        is_typedef_ptr(parsed_type):
         return 'type(c_ptr)'
     elif is_typedef_funptr(parsed_type):
         return 'type(c_funptr)'
     elif is_int(parsed_type) or is_bool(parsed_type):
-        return 'integer(kind={})'.format(parsed_type.type)
+        return f'integer(kind={parsed_type.type})'
     elif is_real(parsed_type):
-        return 'real(kind={})'.format(parsed_type.type)
+        return f'real(kind={parsed_type.type})'
     elif is_GLhandleARB(parsed_type):
         return macro_type(parsed_type.type)
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f'Unhandled return type: {parsed_type.type}')
 
 
-def return_type_impl(command):
+def impl_return_type(command):
     type_ = command.proto.ret
-    parsed_type = type_ if isinstance(type_, ParsedType) else ParsedType.from_string(type_)
 
-    if command.name in ('glGetString', 'glGetStringi'):
-        return 'character(len=:, kind=c_char), pointer'
+    parsed_type = get_parsed_type(type_)
+
+    # Actually return strings but type would give "const GLubyte*"
+    # It should in principle return a pointer to a static string,
+    # but this makes the fortran syntax ugly, so it's copied and is probably
+    # not performance critical or anything
+    # if parsed_type.type == 'GLubyte' and parsed_type.is_const and parsed_type.is_pointer == 1:
+    if command.name in ['glGetString', 'glGetStringi']:
+        return 'character(len=:, kind=c_char), allocatable'
     elif (parsed_type.is_pointer == 1 and is_void(parsed_type)) or \
          is_typedef_ptr(parsed_type):
         return 'type(c_ptr)'
+    # I think only glGetVkProcAddrNV does this
     elif is_typedef_funptr(parsed_type):
-        return 'procedure({}), pointer'.format(parsed_type.type)
-    elif is_int(parsed_type) or is_bool(parsed_type):
-        return 'integer(kind={})'.format(parsed_type.type)
-    elif is_real(parsed_type):
-        return 'real(kind={})'.format(parsed_type.type)
+        return f'procedure({parsed_type.type}), pointer'
     elif is_GLhandleARB(parsed_type):
         return macro_type(parsed_type.type)
+    # Sanity check
+    elif parsed_type.is_pointer > 0:
+        raise NotImplementedError(f'Unhandled pointer return type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
+    elif is_int(parsed_type) or is_bool(parsed_type):
+        return f'integer(kind={parsed_type.type})'
+    elif is_real(parsed_type):
+        return f'real(kind={parsed_type.type})'
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f'Unhandled return type: {parsed_type.type}')
 
 
-def type_interface(type_):
-    if type_ is None:
-        raise NotImplementedError
+def interface_param_type(type_):
+    parsed_type = get_parsed_type(type_)
 
-    parsed_type = type_ if isinstance(type_, ParsedType) else ParsedType.from_string(type_)
-
-    if not parsed_type.is_pointer and is_void(parsed_type):
-        raise NotImplementedError
-
-    if parsed_type.is_pointer > 2:
-        raise NotImplementedError
+    # Sanity check
+    if (parsed_type.is_pointer > 2) or \
+       (is_void(parsed_type) and not parsed_type.is_pointer):
+        raise NotImplementedError(f'Unhandled parameter type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
 
     type_decl = ''
 
-    if parsed_type.is_pointer == 2:
-        type_decl = 'type(c_ptr), dimension(*)'
-    elif is_char(parsed_type):
-        if parsed_type.is_pointer == 1:
-            type_decl = 'character(len=1,kind={}), dimension(*)'.format(parsed_type.type)
-        else:
-            raise RuntimeError('Unsupported type: {} pointer {}'.format(parsed_type.type, parsed_type.is_pointer))
-    elif parsed_type.is_pointer == 2 or \
-         is_typedef_ptr(parsed_type) or is_cl_ptr(parsed_type) or \
-         (parsed_type.is_pointer > 0 and is_void(parsed_type)):
+    # Base type
+    # This should be straightforward for C interfaces
+    # Non const char* should be buffers so we treat them as pointers instead of
+    # converting to null-terminated C string
+    if is_char(parsed_type) and parsed_type.is_pointer == 1 and parsed_type.is_const:
+        type_decl = f'character(len=1,kind={parsed_type.type})'
+    elif is_char(parsed_type) and parsed_type.is_pointer == 2 and parsed_type.is_const:
+        type_decl = f'type(c_ptr)'
+    # Because pointers to scalars and arrays are ambiguous -> all c_ptr
+    elif is_typedef_ptr(parsed_type) or is_cl_ptr(parsed_type):
         type_decl = 'type(c_ptr)'
     elif is_typedef_funptr(parsed_type):
         type_decl = 'type(c_funptr)'
-    elif is_int(parsed_type) or is_bool(parsed_type):
-        type_decl = 'integer(kind={})'.format(parsed_type.type)
-    elif is_real(parsed_type):
-        type_decl = 'real(kind={})'.format(parsed_type.type)
     elif is_GLhandleARB(parsed_type):
         type_decl = macro_type(parsed_type.type)
+    elif parsed_type.is_pointer > 0:
+        type_decl = 'type(c_ptr)'
+    # Then handle non-pointer
+    elif is_int(parsed_type) or is_bool(parsed_type):
+        type_decl = f'integer(kind={parsed_type.type})'
+    elif is_real(parsed_type):
+        type_decl = f'real(kind={parsed_type.type})'
     else:
-        raise RuntimeError('Unsupported type: {} pointer {}'.format(parsed_type.type, parsed_type.is_pointer))
+        raise NotImplementedError(f'Unhandled parameter type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
+
+    # Additional type specs
+    if is_char(parsed_type):
+        type_decl += ', dimension(*)'
 
     if parsed_type.is_pointer == 0 or \
-       (parsed_type.is_pointer == 1 and is_void(parsed_type)) or \
-       is_typedef_funptr(parsed_type) or \
-       is_typedef_ptr(parsed_type) or is_cl_ptr(parsed_type) or \
+       (parsed_type.is_pointer == 1 and not is_char(parsed_type)) or \
        is_GLhandleARB(parsed_type):
-        type_decl = type_decl + ', value'
-    elif is_optional_type(parsed_type):
-        type_decl = type_decl + ', optional'
+        type_decl += ', value'
 
     if parsed_type.is_const or \
-       (parsed_type.is_pointer == 0 and \
-        not (is_typedef_ptr(parsed_type) or is_cl_ptr(parsed_type))):
+       (parsed_type.is_pointer == 0 and (is_int(parsed_type) or is_bool(parsed_type) or is_real(parsed_type))):
         type_decl = type_decl + ', intent(in)'
 
     return type_decl
 
 
-def int_var(param):
-    type_ = param.type
-    name = param.name
-    parsed_type = type_ if isinstance(type_, ParsedType) else ParsedType.from_string(type_)
-
-    if is_char(parsed_type) and parsed_type.is_pointer == 2:
-        return 'character(len=:,kind={}), dimension(:), allocatable :: {}str\n'.format(parsed_type.type, int_identifier(name)) + \
-               'type(c_ptr), dimension(:), allocatable :: {}'.format(int_identifier(name))
-    else:
-        raise RuntimeError('Unsupported type: {} pointer {}'.format(parsed_type.type, parsed_type.is_pointer))
-
-
-def type_impl(type_):
-    parsed_type = type_ if isinstance(type_, ParsedType) else ParsedType.from_string(type_)
+def impl_param_type(type_, command):
+    parsed_type = get_parsed_type(type_)
 
     type_decl = ''
 
-    if is_char(parsed_type):
-        if parsed_type.is_pointer == 1:
-            type_decl = 'character(len=*,kind={})'.format(parsed_type.type)
-        elif parsed_type.is_pointer == 2:
-            type_decl = 'character(len=:,kind={}), dimension(:)'.format(parsed_type.type)
-        else:
-            raise RuntimeError('Unsupported type: {} pointer {}'.format(parsed_type.type, parsed_type.is_pointer))
+    if is_char(parsed_type) and parsed_type.is_pointer == 1:
+        type_decl = f'character(len=*,kind={parsed_type.type})'
+    elif is_char(parsed_type) and parsed_type.is_pointer == 2 and parsed_type.is_const:
+        type_decl = f'character(len=:,kind={parsed_type.type})'
+    # TODO Compatibility, Assumed type is Fortran 2018
+    elif is_void(parsed_type) and parsed_type.is_pointer == 1:
+        type_decl = 'type(*)'
+    elif is_typedef_ptr(parsed_type) or is_cl_ptr(parsed_type):
+        type_decl = 'type(c_ptr)'
     elif parsed_type.is_pointer == 2:
-        type_decl = 'type(c_ptr), dimension(:)'
-    elif is_int(parsed_type) or is_bool(parsed_type):
-        type_decl = 'integer(kind={})'.format(parsed_type.type)
-    elif is_real(parsed_type):
-        type_decl = 'real(kind={})'.format(parsed_type.type)
-    elif parsed_type.is_pointer == 2 or \
-         is_typedef_ptr(parsed_type) or is_cl_ptr(parsed_type) or \
-         (parsed_type.is_pointer > 0 and is_void(parsed_type)):
         type_decl = 'type(c_ptr)'
     elif is_typedef_funptr(parsed_type):
-        type_decl = 'type(c_funptr)'
+        if command.name == 'glDebugMessageCallback':
+            return 'procedure(GLDEBUGPROC), optional'
+        elif command.name == 'glDebugMessageCallbackAMD':
+            return 'procedure(GLDEBUGPROCAMD), optional'
+        elif command.name == 'glDebugMessageCallbackARB':
+            return 'procedure(GLDEBUGPROCARB), optional'
     elif is_GLhandleARB(parsed_type):
         type_decl = macro_type(parsed_type.type)
+    elif is_int(parsed_type) or is_bool(parsed_type):
+        type_decl = f'integer(kind={parsed_type.type})'
+    elif is_real(parsed_type):
+        type_decl = f'real(kind={parsed_type.type})'
     else:
-        raise RuntimeError('Unsupported type: {} pointer {}'.format(parsed_type.type, parsed_type.is_pointer))
+        raise NotImplementedError(f'Unhandled parameter type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
 
-    if is_char(parsed_type):
-        if parsed_type.is_pointer == 2:
-            type_decl = type_decl + ', pointer'
-        elif parsed_type.is_pointer == 1:
-            type_decl = type_decl + ', target'
+    if is_char(parsed_type) and parsed_type.is_pointer == 2 and parsed_type.is_const:
+        type_decl += ', dimension(:)'
+        type_decl += ', pointer'
+
+    if parsed_type.is_pointer == 1 and not (is_char(parsed_type) and parsed_type.is_const):
+        type_decl += ', target'
 
     if is_optional_type(parsed_type):
-        type_decl = type_decl + ', optional'
+        type_decl += ', optional'
 
     if parsed_type.is_const:
-        type_decl = type_decl + ', intent(in)'
+        type_decl += ', intent(in)'
 
     return type_decl
+
+
+def is_requiring_int_var(param):
+    type_ = param.type
+    parsed_type = get_parsed_type(type_)
+
+    return is_char(parsed_type) and parsed_type.is_pointer == 2
+
+
+def intermediate_var(param):
+    type_ = param.type
+    name = param.name
+    parsed_type = get_parsed_type(type_)
+
+    if is_char(parsed_type) and parsed_type.is_pointer == 2:
+        return f'character(len=:,kind={parsed_type.type}), dimension(:), allocatable :: {int_identifier(name)}str\n' + \
+               ' '*12 + f'type(c_ptr), dimension(:), allocatable :: {int_identifier(name)}'
+    else:
+        raise NotImplementedError(f'Unhandled intermediate type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
+
+
+def int_var_pass(param):
+    type_ = param.type
+    name = param.name
+    parsed_type = get_parsed_type(type_)
+
+    if is_char(parsed_type) and parsed_type.is_pointer == 2:
+        return f'call f_c_strarray({arg_identifier(name)}, {int_identifier(name)}str, {int_identifier(name)})'
+    else:
+        raise RuntimeError(f'Unhandled intermediate type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
+
+
+def is_optional(param):
+    type_ = param.type
+    parsed_type = get_parsed_type(type_)
+
+    return is_optional_type(parsed_type)
+
+
+def is_optional_type(parsed_type):
+    return (parsed_type.is_pointer > 0 or is_typedef_ptr(parsed_type) or is_cl_ptr(parsed_type) or is_typedef_funptr(parsed_type)) and \
+           not is_char(parsed_type) and not is_GLhandleARB(parsed_type)
+
+
+def opt_type(type_):
+    parsed_type = get_parsed_type(type_)
+
+    if parsed_type.is_pointer > 0 or \
+         is_typedef_ptr(parsed_type) or is_cl_ptr(parsed_type):
+        return 'type(c_ptr)'
+    elif is_typedef_funptr(parsed_type):
+        return 'type(c_funptr)'
+    else:
+        raise RuntimeError(f'Unhandled optional type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
+
+
+def opt_identifier(name):
+    return 'opt_' + arg_identifier(name)
+
+
+def opt_pass(param):
+    type_ = param.type
+    name = param.name
+    parsed_type = get_parsed_type(type_)
+
+    if parsed_type.is_pointer == 1 and \
+       (is_void(parsed_type) or is_int(parsed_type) or is_bool(parsed_type) or is_real(parsed_type)):
+        return f'{opt_identifier(name)} = c_loc({arg_identifier(name)})'
+    elif is_typedef_funptr(parsed_type):
+        return f'{opt_identifier(name)} = c_funloc({arg_identifier(name)})'
+    else:
+        return f'{opt_identifier(name)} = {arg_identifier(name)}'
+
+
+def opt_null(param):
+    type_ = param.type
+    name = param.name
+    parsed_type = get_parsed_type(type_)
+
+    if is_typedef_funptr(parsed_type):
+        return f'{opt_identifier(name)} = c_null_funptr'
+    else:
+        return f'{opt_identifier(name)} = c_null_ptr'
 
 
 def forward_arg(param):
     type_ = param.type
     name = param.name
-    parsed_type = type_ if isinstance(type_, ParsedType) else ParsedType.from_string(type_)
+    parsed_type = get_parsed_type(type_)
 
     if is_char(parsed_type) and parsed_type.is_pointer == 1:
         if parsed_type.is_const or name == 'glGetPerfQueryIdByNameINTEL':
-            return 'f_c_str({})'.format(arg_identifier(name))
+            return f'f_c_str({arg_identifier(name)})'
         else:
-            return arg_identifier(name)
+            return f'c_loc({arg_identifier(name)})'
+    elif is_optional(param):
+        return opt_identifier(name)
     elif is_requiring_int_var(param):
         return int_identifier(name)
     else:
         return arg_identifier(name)
 
 
-def preprocess_param(param):
-    type_ = param.type
-    name = param.name
-    parsed_type = type_ if isinstance(type_, ParsedType) else ParsedType.from_string(type_)
-
-    if is_char(parsed_type) and parsed_type.is_pointer == 2:
-        return 'call f_c_strarray({}, {}str, {})'.format(arg_identifier(name), int_identifier(name), int_identifier(name))
-    else:
-        raise RuntimeError('Unsupported type: {} pointer {}'.format(parsed_type.type, parsed_type.is_pointer))
-
-
-def format_args(command):
+def input_arg_list(command):
     # Compilers will usually complain about lines longer than like 132 lines
     # in fortran so add a lot of line breaks
     if len(command.params) > 0:
-        return '&\n                ' + \
-               ',&\n                '.join(arg_identifier(param.name) for param in command.params) + \
-               '&\n            '
+        return ' &\n                ' + \
+               ', &\n                '.join(arg_identifier(param.name) for param in command.params) + \
+               ' &\n        '
     else:
         return ''
 
 
-def format_int_args(command):
+def int_arg_list(command):
     if len(command.params) > 0:
-        return '&\n                ' + \
-               ',&\n                '.join(forward_arg(param) for param in command.params) + \
-               '&\n            '
+        return ' &\n                ' + \
+               ', &\n                '.join(forward_arg(param) for param in command.params) + \
+               ' &\n            '
     else:
         return ''
 
 
 def format_result(command):
     ret_type = command.proto.ret
-    parsed_type = ret_type if isinstance(ret_type, ParsedType) else ParsedType.from_string(ret_type)
+    parsed_type = get_parsed_type(ret_type)
 
     if command.name in ('glGetString', 'glGetStringi'):
-        return 'call c_f_strpointer(' + proc_pointer(command.name) + \
-               '(' + format_int_args(command) + ')' + ', res)'
+        return 'call c_f_str(' + proc_pointer(command.name) + \
+               '(' + int_arg_list(command) + ')' + ', res)'
     elif is_typedef_funptr(parsed_type):
         return 'call c_f_procpointer(' + proc_pointer(command.name) + \
-               '(' + format_int_args(command) + ')' + ', res)'
+               '(' + int_arg_list(command) + ')' + ', res)'
     else:
-        return 'res = ' + proc_pointer(command.name) + '(' + format_int_args(command) + ')'
+        return 'res = ' + proc_pointer(command.name) + '(' + int_arg_list(command) + ')'
 
 
 def is_returning(command):
     ret_type = command.proto.ret
-    parsed_type = ret_type if isinstance(ret_type, ParsedType) else ParsedType.from_string(ret_type)
+    parsed_type = get_parsed_type(ret_type)
 
+    # If prototype return type is void (but not void*), it is not returning
     return not (not parsed_type.is_pointer and parsed_type.type == 'void')
-
-
-def is_requiring_int_var(param):
-    type_ = param.type
-    parsed_type = type_ if isinstance(type_, ParsedType) else ParsedType.from_string(type_)
-
-    return (is_char(parsed_type) and parsed_type.is_pointer == 2)
-
-
-def is_requiring_preprocess(param):
-    type_ = param.type
-    parsed_type = type_ if isinstance(type_, ParsedType) else ParsedType.from_string(type_)
-
-    return (is_char(parsed_type) and parsed_type.is_pointer == 2)
-
-
-def is_optional(param):
-    type_ = param.type
-    parsed_type = type_ if isinstance(type_, ParsedType) else ParsedType.from_string(type_)
-
-    return is_optional_type(parsed_type)
-
-
-def is_optional_type(parsed_type):
-    return parsed_type.is_pointer > 0
 
 
 def is_void(parsed_type):
@@ -427,6 +457,7 @@ def is_typedef_funptr(parsed_type):
     return parsed_type.type in _GL_TYPEDEF_FUNPTR
 
 
+# This type must be handled seperately because of different definitions on mac
 def is_GLhandleARB(parsed_type):
     return parsed_type.type == 'GLhandleARB'
 
@@ -436,14 +467,14 @@ def arg_identifier(name):
 
 
 def int_identifier(name):
-    return 'c' + arg_identifier(name)
+    return 'int_' + arg_identifier(name)
 
 
-def proc_interface(name):
+def interface_proc_name(name):
     return 'c_' + name + 'Proc'
 
 
-def proc_impl(name):
+def impl_proc_name(name):
     return name
 
 
@@ -453,6 +484,15 @@ def proc_pointer(name):
 
 def macro_type(type_name):
     return 'type(' + type_name + ')'
+
+
+def get_parsed_type(type_):
+    if isinstance(type_, ParsedType):
+        return type_
+    elif isinstance(type_, str):
+        return ParsedType.from_string(type_)
+    else:
+        raise RuntimeError(f'Unknown return type: {type_}')
 
 
 class FortranConfig(Config):
@@ -480,30 +520,36 @@ class FortranGenerator(JinjaGenerator):
     def __init__(self, *args, **kwargs):
         JinjaGenerator.__init__(self, *args, **kwargs)
 
+        print('HEY')
+
         self.environment.filters.update(
             enum_type=jinja2_contextfilter(lambda ctx, enum: enum_type(enum, ctx['feature_set'])),
             enum_value=jinja2_contextfilter(lambda ctx, enum: enum_value(enum, ctx['feature_set'])),
-            proc_type=proc_type,
-            return_type_interface=return_type_interface,
-            return_type_impl=return_type_impl,
-            type_interface=type_interface,
-            type_impl=type_impl,
+
+            interface_proc_name=interface_proc_name,
+            interface_param_type=interface_param_type,
+            interface_return_type=interface_return_type,
+            impl_proc_name=impl_proc_name,
+            impl_param_type=impl_param_type,
+            impl_return_type=impl_return_type,
+
             format_result=format_result,
-            int_var=int_var,
-            args=format_args,
-            int_args=format_int_args,
+            intermediate_var=intermediate_var,
+            input_arg_list=input_arg_list,
+            int_arg_list=int_arg_list,
             identifier=arg_identifier,
             int_identifier=int_identifier,
-            preprocess=preprocess_param,
+            opt_identifier=opt_identifier,
+            int_var_pass=int_var_pass,
+            opt_type=opt_type,
+            opt_pass=opt_pass,
+            opt_null=opt_null,
             proc_pointer=proc_pointer,
-            proc_interface=proc_interface,
-            proc_impl=proc_impl
         )
 
         self.environment.tests.update(
             returning=is_returning,
             requiring_int_var=is_requiring_int_var,
-            requiring_preprocess=is_requiring_preprocess,
             optional=is_optional
         )
 

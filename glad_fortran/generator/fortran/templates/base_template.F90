@@ -25,6 +25,12 @@
 !
 ! -----------------
 
+! --- Notes for mapping certain fortran variables to gl routines ---
+!
+! Functions taking arrays usually take the size of the array as an int.
+! Arrays are thus passed by giving their size, and then the first element of the array (x(1))
+! Arrays given to GL must thus be continuous in memory
+
 module gl
     use, intrinsic :: iso_c_binding
 
@@ -89,6 +95,18 @@ module gl
             type(c_ptr), value :: userParam
         end subroutine GLDEBUGPROC
 
+        subroutine GLDEBUGPROCAMD(source, type, id, severity, length, message, userParam) bind(C)
+            import
+            implicit none
+            integer(kind=GLenum), value :: source
+            integer(kind=GLenum), value :: type
+            integer(kind=GLuint), value :: id
+            integer(kind=GLenum), value :: severity
+            integer(kind=GLsizei), value :: length
+            character(len=1,kind=GLchar), dimension(*) :: message
+            type(c_ptr), value :: userParam
+        end subroutine GLDEBUGPROCAMD
+
         subroutine GLDEBUGPROCARB(source, type, id, severity, length, message, userParam) bind(C)
             import
             implicit none
@@ -112,18 +130,6 @@ module gl
             character(len=1,kind=GLchar), dimension(*) :: message
             type(c_ptr), value :: userParam
         end subroutine GLDEBUGPROCKHR
-
-        subroutine GLDEBUGPROCAMD(source, type, id, severity, length, message, userParam) bind(C)
-            import
-            implicit none
-            integer(kind=GLenum), value :: source
-            integer(kind=GLenum), value :: type
-            integer(kind=GLuint), value :: id
-            integer(kind=GLenum), value :: severity
-            integer(kind=GLsizei), value :: length
-            character(len=1,kind=GLchar), dimension(*) :: message
-            type(c_ptr), value :: userParam
-        end subroutine GLDEBUGPROCAMD
 
         subroutine GLVULKANPROCNV() bind(C)
         end subroutine GLVULKANPROCNV
@@ -152,7 +158,7 @@ module gl
     ! -------------
 
     {% for command in feature_set.commands %}
-    procedure({{ command.name|proc_interface }}), pointer, private :: &
+    procedure({{ command.name|interface_proc_name }}), pointer, private :: &
         {{ command.name|proc_pointer }}
     {% endfor %}
 
@@ -161,23 +167,27 @@ module gl
     ! -------------
 
     abstract interface
+
         {% for command in feature_set.commands %}
         {% if command is returning %}
-        {{ command|return_type_interface }} &
+        function {{ command.name|interface_proc_name }}({{ command|input_arg_list }}) result(res) bind(C)
+        {% else %}
+        subroutine {{ command.name|interface_proc_name }}({{ command|input_arg_list }}) bind(C)
         {% endif %}
-        {{ command|proc_type }} {{ command.name|proc_interface }}({{ command|args }}) bind(C)
-            {% if command is returning %}
-            import
-            {% else %}
-            {% if command.params|length != 0 %}
+            {% if command is returning or command.params|length != 0 %}
             import
             implicit none
             {% endif %}
-            {% endif %}
             {% for param in command.params %}
-            {{ param.type|type_interface }} :: {{ param.name|identifier }}
+            {{ param.type|interface_param_type }} :: {{ param.name|identifier }}
             {% endfor %}
-        end {{ command|proc_type }} {{ command.name|proc_interface }}
+        {% if command is returning %}
+            {{ command|interface_return_type }} :: res
+        end function {{ command.name|interface_proc_name }}
+        {% else %}
+        end subroutine {{ command.name|interface_proc_name }}
+        {% endif %}
+
         {% endfor %}
     end interface
 
@@ -185,54 +195,69 @@ module gl
     private :: c_strlen, c_ptr_strlen, c_char_strlen
 
     interface c_strlen
+
         pure function c_ptr_strlen(cstr) result(length) bind(C, name="strlen")
             import
             implicit none
             type(c_ptr), value, intent(in) :: cstr
             integer(kind=c_size_t) :: length
         end function c_ptr_strlen
+
         pure function c_char_strlen(cstr) result(length) bind(C, name="strlen")
             import
             implicit none
             character(len=1,kind=c_char), dimension(*), intent(in) :: cstr
             integer(kind=c_size_t) :: length
         end function c_char_strlen
+
     end interface c_strlen
 
     contains
 
         {% for command in feature_set.commands %}
-        {{ command|proc_type }} {{ command.name|proc_impl }}({{ command|args }}) {{ 'result(res)' if command is returning }}
+        {% if command is returning %}
+        function {{ command.name|impl_proc_name }}({{ command|input_arg_list }}) result(res)
+        {% else %}
+        subroutine {{ command.name|impl_proc_name }}({{ command|input_arg_list }})
+        {% endif %}
             implicit none
             {% for param in command.params %}
-            {{ param.type|type_impl }} :: {{ param.name|identifier }}
+            {{ param.type|impl_param_type(command) }} :: {{ param.name|identifier }}
             {% endfor %}
             {% for param in command.params %}
+            {% if param is optional %}
+            {{ param.type|opt_type }} :: {{ param.name|opt_identifier }}
+            {% endif %}
             {% if param is requiring_int_var %}
-            {{ param|int_var }}
+            {{ param|intermediate_var }}
             {% endif %}
             {% endfor %}
             {% if command is returning %}
-            {{ command|return_type_impl }} :: res
+            {{ command|impl_return_type }} :: res
             {% endif %}
 
             {% for param in command.params %}
-            {% if param is requiring_preprocess %}
             {% if param is optional %}
             if (present({{ param.name|identifier }})) then
-                {{ param|preprocess }}
+                {{ param|opt_pass }}
+            else
+                {{ param|opt_null }}
             end if
-            {% else %}
-            {{ param|preprocess }}
             {% endif %}
+            {% if param is requiring_int_var %}
+            {{ param|int_var_pass }}
             {% endif %}
             {% endfor %}
             {% if command is returning %}
             {{ command|format_result }}
             {% else %}
-            call {{ command.name|proc_pointer }}({{ command|int_args }})
+            call {{ command.name|proc_pointer }}({{ command|int_arg_list }})
             {% endif %}
-        end {{ command|proc_type }} {{ command.name|proc_impl }}
+        {% if command is returning %}
+        end function {{ command.name|impl_proc_name }}
+        {% else %}
+        end subroutine {{ command.name|impl_proc_name }}
+        {% endif %}
         {% endfor %}
 
         {% for api in feature_set.info.apis %}
@@ -251,36 +276,48 @@ module gl
         end function gladLoad{{ api|api }}
         {% endfor %}
 
-        subroutine c_f_strpointer(cptr, fptr)
+        ! Convert a C string (char*) to a Fortran character string
+        subroutine c_f_str(cptr, fstr)
             implicit none
             type(c_ptr), intent(in) :: cptr
-            character(len=:,kind=c_char), pointer, intent(out) :: fptr
+            character(len=:,kind=c_char), allocatable, intent(out) :: fstr
 
-            character(len=c_strlen(cptr),kind=c_char), pointer :: temp
-            call c_f_pointer(cptr, temp)
-            fptr => temp
-        end subroutine c_f_strpointer
+            character(len=:,kind=c_char), dimension(:), pointer :: cstr
+            integer :: i
 
+            call c_f_pointer(cptr, cstr, [c_strlen(cptr)])
+            allocate(character(len=len(cstr)) :: fstr)
+            do i = 1,len(cstr)
+                fstr(i:i) = cstr(i)
+            end do
+        end subroutine c_f_str
+
+        ! Create a (null-terminated) C string from a Fortran string
         pure function f_c_str(fstr) result(cstr)
             implicit none
             character(len=*,kind=c_char), intent(in) :: fstr
             character(len=1,kind=c_char), dimension(:), allocatable :: cstr
 
-            integer :: size
+            integer :: csize
             integer :: i
 
-            size = len_trim(fstr) + 1
-            allocate(character(len=1,kind=c_char) :: cstr(size))
-            do i = 1,size-1
+            csize = len_trim(fstr) + 1
+            allocate(character(len=1,kind=c_char) :: cstr(csize))
+            do i = 1,csize-1
                 cstr(i) = fstr(i:i)
             end do
-            cstr(size) = c_null_char
+            cstr(csize) = c_null_char
         end function f_c_str
 
+        ! Create an array of C strings (char**) from an array of Fortran strings.
+        ! We return both the array of generated c strings and the array of pointers
+        ! to the beginning of each strings because we need both to be in the same scope
+        ! to avoid segfaults on the array of pointers, which is the one that will be passed
+        ! to GL functions.
         subroutine f_c_strarray(fstrings, cstrings, carray)
             implicit none
             character(len=:,kind=c_char), dimension(:), pointer, intent(in) :: fstrings
-            character(len=:,kind=c_char), dimension(:), target, allocatable, intent(out) :: cstrings
+            character(len=:,kind=c_char), dimension(:), allocatable, target, intent(out) :: cstrings
             type(c_ptr), dimension(:), allocatable, intent(out) :: carray
 
             integer :: i
