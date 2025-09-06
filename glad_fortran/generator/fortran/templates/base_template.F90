@@ -191,6 +191,10 @@ module gl
         {% endfor %}
     end interface
 
+    ! -------------
+    ! Fortran to C string utilities
+    ! -------------
+
     private :: f_c_str, f_c_strarray
     private :: c_strlen, c_ptr_strlen, c_char_strlen
 

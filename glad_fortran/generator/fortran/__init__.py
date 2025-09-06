@@ -1,3 +1,4 @@
+from collections import defaultdict
 import re
 import jinja2
 
@@ -13,8 +14,7 @@ from glad.generator.util import (
 from glad.parse import ParsedType, EnumType
 from glad.sink import LoggingSink
 
-_FORTRAN_TYPE_MAPPING = {
-#    'void': 'c_void',
+_F_TO_C_TYPE = {
     'char': 'c_char',
     'uchar': 'c_char',
     'float': 'c_float',
@@ -33,7 +33,7 @@ _FORTRAN_TYPE_MAPPING = {
     'ull': 'c_int64_t',
 }
 
-_GL_INT_TYPES = (
+_GL_INT_TYPES = [
     'GLbyte', 'GLubyte',
     'GLshort', 'GLushort',
     'GLint', 'GLuint', 'GLint64', 'GLuint64', 'GLint64EXT', 'GLuint64EXT',
@@ -41,45 +41,58 @@ _GL_INT_TYPES = (
     'GLsizei', 'GLclampx', 'GLfixed', 'GLhalf', 'GLhalfNV', 'GLhalfARB',
     'GLenum', 'GLbitfield',
     'GLvdpauSurfaceNV'
-)
+]
 
-_GL_REAL_TYPES = (
+_GL_REAL_TYPES = [
     'GLfloat', 'GLdouble',
     'GLclampf', 'GLclampd'
-)
+]
 
-_GL_CHAR_TYPES = (
+_GL_CHAR_TYPES = [
     'GLchar', 'GLcharARB'
-)
+]
 
-_GL_TYPEDEF_PTR = (
+_GL_TYPEDEF_PTR = [
     'GLsync', 'GLeglClientBufferEXT', 'GLeglImageOES'
-)
+]
 
-_GL_CL_TYPES = (
+_CL_TYPES = [
     '_cl_context', '_cl_event'
-)
+]
 
-_GL_TYPEDEF_FUNPTR = (
+_GL_TYPEDEF_FUNPTR = [
     'GLDEBUGPROC', 'GLDEBUGPROCARB', 'GLDEBUGPROCKHR', 'GLDEBUGPROCAMD',
     'GLVULKANPROCNV'
-)
+]
 
-_INT_KINDS = (
+_GL_TYPE_SUFFIXES = [
+    'ui64v', 'ui64',
+    'ubv', 'usv', 'uiv',
+    'bv', 'sv', 'iv', 'fv', 'dv',
+    'ub', 'us', 'ui',
+    'v', 'b', 's', 'i', 'f', 'd'
+]
+
+_GL_VENDOR_SUFFIXES = [
+    'NV', 'AMD', 'APPLE', 'ARB', 'ATI', 'EXT', 'INTEL', 'KHR', 'MESA', 'OES', 'SUN'
+]
+
+_F_INT_KINDS = [
     'c_short', 'c_int', 'c_long', 'c_long_long',
     'c_signed_char', 'c_size_t', 'c_intptr_t',
     'c_int8_t', 'c_int16_t', 'c_int32_t', 'c_int64_t'
-)
+]
 
-_REAL_KINDS = (
+_F_REAL_KINDS = [
     'c_float', 'c_double', 'c_long_double'
-)
+]
 
-_CHAR_KINDS = (
+_F_CHAR_KINDS = [
     'c_char'
-)
+]
 
 
+# --- Generate GL enumerated values
 def enum_type_kind(enum, feature_set):
     # Hex constant
     if enum.value.startswith('0x'):
@@ -97,11 +110,11 @@ def enum_type_kind(enum, feature_set):
 def enum_type(enum, feature_set):
     kind = enum_type_kind(enum, feature_set)
 
-    if kind in _INT_KINDS:
+    if kind in _F_INT_KINDS:
         return 'integer(kind={})'.format(kind)
-    elif kind in _REAL_KINDS:
+    elif kind in _F_REAL_KINDS:
         return 'real(kind={})'.format(kind)
-    elif kind in _CHAR_KINDS:
+    elif kind in _F_CHAR_KINDS:
         return 'character(len=*,kind={})'.format(kind)
     else:
         raise RuntimeError(f'Unknown enumeration type for kind: {kind}')
@@ -111,7 +124,7 @@ def enum_value(enum, feature_set):
     kind = enum_type_kind(enum, feature_set)
     value = enum.value
 
-    if kind in _INT_KINDS:
+    if kind in _F_INT_KINDS:
         if value.startswith('0x'):
             boz_size = 16 if len(value[2:]) > 8 else 8 # number of hex digits for int64 or int32
             boz_value = value[2:].zfill(boz_size)
@@ -124,6 +137,8 @@ def enum_value(enum, feature_set):
         raise RuntimeError(f'Unknown enumeration value for kind: {kind} and {value}')
 
 
+# --- Generate Fortran function/subroutine interfaces to
+#     C functions using appropriate type kinds for C function arguments
 def interface_return_type(command):
     type_ = command.proto.ret
 
@@ -146,37 +161,6 @@ def interface_return_type(command):
         return f'real(kind={parsed_type.type})'
     elif is_GLhandleARB(parsed_type):
         return macro_type(parsed_type.type)
-    else:
-        raise NotImplementedError(f'Unhandled return type: {parsed_type.type}')
-
-
-def impl_return_type(command):
-    type_ = command.proto.ret
-
-    parsed_type = get_parsed_type(type_)
-
-    # Actually return strings but type would give "const GLubyte*"
-    # It should in principle return a pointer to a static string,
-    # but this makes the fortran syntax ugly, so it's copied and is probably
-    # not performance critical or anything
-    # if parsed_type.type == 'GLubyte' and parsed_type.is_const and parsed_type.is_pointer == 1:
-    if command.name in ['glGetString', 'glGetStringi']:
-        return 'character(len=:, kind=c_char), allocatable'
-    elif (parsed_type.is_pointer == 1 and is_void(parsed_type)) or \
-         is_typedef_ptr(parsed_type):
-        return 'type(c_ptr)'
-    # I think only glGetVkProcAddrNV does this
-    elif is_typedef_funptr(parsed_type):
-        return f'procedure({parsed_type.type}), pointer'
-    elif is_GLhandleARB(parsed_type):
-        return macro_type(parsed_type.type)
-    # Sanity check
-    elif parsed_type.is_pointer > 0:
-        raise NotImplementedError(f'Unhandled pointer return type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
-    elif is_int(parsed_type) or is_bool(parsed_type):
-        return f'integer(kind={parsed_type.type})'
-    elif is_real(parsed_type):
-        return f'real(kind={parsed_type.type})'
     else:
         raise NotImplementedError(f'Unhandled return type: {parsed_type.type}')
 
@@ -232,6 +216,39 @@ def interface_param_type(type_):
     return type_decl
 
 
+# --- Fortran implementations of GL functions wrap calls to
+#     generated C function interfaces
+def impl_return_type(command):
+    type_ = command.proto.ret
+
+    parsed_type = get_parsed_type(type_)
+
+    # Actually return strings but type would give "const GLubyte*"
+    # It should in principle return a pointer to a static string,
+    # but this makes the fortran syntax ugly, so it's copied and is probably
+    # not performance critical or anything
+    # if parsed_type.type == 'GLubyte' and parsed_type.is_const and parsed_type.is_pointer == 1:
+    if command.name in ['glGetString', 'glGetStringi']:
+        return 'character(len=:, kind=c_char), allocatable'
+    elif (parsed_type.is_pointer == 1 and is_void(parsed_type)) or \
+         is_typedef_ptr(parsed_type):
+        return 'type(c_ptr)'
+    # I think only glGetVkProcAddrNV does this
+    elif is_typedef_funptr(parsed_type):
+        return f'procedure({parsed_type.type}), pointer'
+    elif is_GLhandleARB(parsed_type):
+        return macro_type(parsed_type.type)
+    # Sanity check
+    elif parsed_type.is_pointer > 0:
+        raise NotImplementedError(f'Unhandled pointer return type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
+    elif is_int(parsed_type) or is_bool(parsed_type):
+        return f'integer(kind={parsed_type.type})'
+    elif is_real(parsed_type):
+        return f'real(kind={parsed_type.type})'
+    else:
+        raise NotImplementedError(f'Unhandled return type: {parsed_type.type}')
+
+
 def impl_param_type(type_, command):
     parsed_type = get_parsed_type(type_)
 
@@ -280,6 +297,8 @@ def impl_param_type(type_, command):
     return type_decl
 
 
+# --- Intermediate variables in the implementations are used to wrap calls to c_loc/c_funloc (for
+#     pointers) and handle Fortran to C string conversions
 def is_requiring_int_var(param):
     type_ = param.type
     parsed_type = get_parsed_type(type_)
@@ -310,6 +329,8 @@ def int_var_pass(param):
         raise RuntimeError(f'Unhandled intermediate type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
 
 
+# --- C Pointer arguments shown as Fortran optional arguments using intermediate
+#     type(c_ptr) variable to give a sense of passing null pointers
 def is_optional(param):
     type_ = param.type
     parsed_type = get_parsed_type(type_)
@@ -363,6 +384,18 @@ def opt_null(param):
         return f'{opt_identifier(name)} = c_null_ptr'
 
 
+# --- Generate function signature/call argument list
+def input_arg_list(command):
+    # Compilers will usually complain about lines longer than like 132 lines
+    # in fortran so add a lot of line breaks
+    if len(command.params) > 0:
+        return ' &\n                ' + \
+               ', &\n                '.join(arg_identifier(param.name) for param in command.params) + \
+               ' &\n        '
+    else:
+        return ''
+
+
 def forward_arg(param):
     type_ = param.type
     name = param.name
@@ -379,17 +412,6 @@ def forward_arg(param):
         return int_identifier(name)
     else:
         return arg_identifier(name)
-
-
-def input_arg_list(command):
-    # Compilers will usually complain about lines longer than like 132 lines
-    # in fortran so add a lot of line breaks
-    if len(command.params) > 0:
-        return ' &\n                ' + \
-               ', &\n                '.join(arg_identifier(param.name) for param in command.params) + \
-               ' &\n        '
-    else:
-        return ''
 
 
 def int_arg_list(command):
@@ -415,6 +437,52 @@ def format_result(command):
         return 'res = ' + proc_pointer(command.name) + '(' + int_arg_list(command) + ')'
 
 
+# --- Generate generic interfaces for some GL function variants
+#def split_function_name(func):
+#    basename = func
+#    vendor_id = ''
+#    for v in _GL_VENDOR_SUFFIXES:
+#        if basename.endswith(v):
+#            vendor_id = v
+#            basename = basename[:-len(v)]
+#            break
+#
+#    type_suffix = ''
+#    for t in _GL_TYPE_SUFFIXES:
+#        # Try to avoid stipping the 'd' at the end of e.g. 'Indexed' or 'Enabled'
+#        if basename.endswith(t) and \
+#           not ((t == 'd' and basename.endswith('ed')) or \
+#                (t == 'dv' and basename.endswith('edv'))):
+#            basename = basename[:-len(t)]
+#            type_suffix = t
+#            break
+#
+#    return basename, type_suffix, vendor_id
+#
+#def group_functions(func_list):
+#    groups = defaultdict(list)
+#    for func in func_list:
+#        basename, type_suffix, vendor_id = split_function_name(func)
+#        key = basename + vendor_id
+#        groups[key].append(func)
+#    return {k: v for k,v in groups.items() if len(v) > 1}
+#
+#
+#def make_generic_interfaces(commands):
+#    names = [command.name for command in commands]
+#    groups = group_functions(names)
+#    block = ''
+#    for name,variants in groups.items():
+#        block += '\n    interface ' + name
+#        # Again we must care about line truncation
+#        for variant in variants:
+#            block += '\n        module procedure ' + variant
+#        block += '\n    end interface ' + name
+#
+#    return block
+
+
+# ---  Type testing functions
 def is_returning(command):
     ret_type = command.proto.ret
     parsed_type = get_parsed_type(ret_type)
@@ -450,7 +518,7 @@ def is_typedef_ptr(parsed_type):
 def is_cl_ptr(parsed_type):
     # _cl_context and _cl_event types can have
     # leading blank spaces for some reason
-    return parsed_type.type.strip() in _GL_CL_TYPES
+    return parsed_type.type.strip() in _CL_TYPES
 
 
 def is_typedef_funptr(parsed_type):
@@ -462,6 +530,7 @@ def is_GLhandleARB(parsed_type):
     return parsed_type.type == 'GLhandleARB'
 
 
+# --- Naming functions
 def arg_identifier(name):
     return name
 
@@ -486,6 +555,7 @@ def macro_type(type_name):
     return 'type(' + type_name + ')'
 
 
+# --- Utility functions
 def get_parsed_type(type_):
     if isinstance(type_, ParsedType):
         return type_
@@ -493,6 +563,38 @@ def get_parsed_type(type_):
         return ParsedType.from_string(type_)
     else:
         raise RuntimeError(f'Unknown return type: {type_}')
+
+
+
+
+#import re
+#from collections import defaultdict
+#
+## Regex for OpenGL function names
+## Captures: base (glSomething), type suffix (i, f, d, iv, fv, etc.), extension suffix (ARB, AMD...)
+#func_pattern = re.compile(r'^(gl[^(0-9]*[0-9]?[0-9]?)'  # base, e.g. glVertex3
+#                          r'([a-z]+)?'               # type suffix (i, f, iv, fv...)
+#                          r'([A-Z]{2,})?$')             # extension suffix (ARB, AMD...)
+#
+#def group_opengl_functions(func_names):
+#    groups = defaultdict(list)
+#    for name in func_names:
+#        match = func_pattern.match(name)
+#        if not match:
+#            continue
+#        base, type_suffix, ext_suffix = match.groups()
+#        type_suffix = type_suffix or ''
+#        ext_suffix = ext_suffix or ''
+#        # Normalised key = base without type or extension suffix
+#        key = base
+#        groups[key].append({
+#            "full": name,
+#            "type_suffix": type_suffix,
+#            "extension": ext_suffix
+#        })
+#    return groups
+#
+#
 
 
 class FortranConfig(Config):
@@ -520,8 +622,6 @@ class FortranGenerator(JinjaGenerator):
     def __init__(self, *args, **kwargs):
         JinjaGenerator.__init__(self, *args, **kwargs)
 
-        print('HEY')
-
         self.environment.filters.update(
             enum_type=jinja2_contextfilter(lambda ctx, enum: enum_type(enum, ctx['feature_set'])),
             enum_value=jinja2_contextfilter(lambda ctx, enum: enum_value(enum, ctx['feature_set'])),
@@ -545,6 +645,8 @@ class FortranGenerator(JinjaGenerator):
             opt_pass=opt_pass,
             opt_null=opt_null,
             proc_pointer=proc_pointer,
+
+#            make_generic_interfaces=make_generic_interfaces,
         )
 
         self.environment.tests.update(
