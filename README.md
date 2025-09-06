@@ -74,7 +74,7 @@ real, dimension(3) :: v
 ! ...
 
 call glVertex3fv(v) ! Wrong
-call glVertex3dv(v(1)) ! Right
+call glVertex3fv(v(1)) ! Right
 ```
 
 In this example, the C function expects a pointer (i.e. to the first element) but the Fortran
