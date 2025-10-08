@@ -201,11 +201,12 @@ def interface_param_type(type_):
         raise NotImplementedError(f'Unhandled parameter type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
 
     # Additional type specs
-    if is_char(parsed_type):
+    if is_char(parsed_type) and parsed_type.is_const:
         type_decl += ', dimension(*)'
 
     if parsed_type.is_pointer == 0 or \
-       (parsed_type.is_pointer == 1 and not is_char(parsed_type)) or \
+       (parsed_type.is_pointer == 1 and
+        not (is_char(parsed_type) and parsed_type.is_const)) or \
        is_GLhandleARB(parsed_type):
         type_decl += ', value'
 
