@@ -301,28 +301,21 @@ function(glad_add_library TARGET)
     endif()
 
     if(GLAD_LANGUAGE STREQUAL "fortran")
-        # Must hard code INTERFACE for modules to work
-        add_library("${TARGET}" INTERFACE)
+        add_library("${TARGET}" ${GLAD_ADD_LIBRARY_ARGS})
 
-        target_sources("${TARGET}" INTERFACE ${GLAD_FILES})
+        set_target_properties("${TARGET}"
+            PROPERTIES
+            Fortran_MODULE_DIRECTORY ${GLAD_DIR}/mod
+            Fortran_PREPROCESS ON
+        )
+
+        target_sources("${TARGET}" PRIVATE ${GLAD_FILES})
 
         target_include_directories("${TARGET}"
-            INTERFACE
-                "${GLAD_DIR}/include"
-            )
-
-        target_link_libraries("${TARGET}"
-            INTERFACE
-                ${CMAKE_DL_LIBS}
-            )
-
-        if(GG_SHARED)
-            target_compile_definitions("${TARGET}" INTERFACE GLAD_API_CALL_EXPORT)
-            set_target_properties("${TARGET}"
-                PROPERTIES
-                DEFINE_SYMBOL "GLAD_API_CALL_EXPORT_BUILD"
-                )
-        endif()
+            PUBLIC
+            "${GLAD_DIR}/include"
+            "${GLAD_DIR}/mod"
+        )
     else()
         add_library("${TARGET}" ${GLAD_ADD_LIBRARY_ARGS} ${GLAD_FILES})
 
