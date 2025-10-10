@@ -271,19 +271,36 @@ function(glad_add_library TARGET)
     set(GLAD_ARGS_PATH "${GLAD_DIR}/args.txt")
 
     # add make custom target
-    add_custom_command(
-        OUTPUT ${GLAD_FILES} ${GLAD_ARGS_PATH}
-        COMMAND echo Cleaning ${GLAD_DIR}
-        COMMAND ${CMAKE_COMMAND} -E remove_directory ${GLAD_DIR}
-        COMMAND ${CMAKE_COMMAND} -E make_directory   ${GLAD_DIR}
-        COMMAND echo Generating with args ${GLAD_ARGS}
-        COMMAND ${Python_EXECUTABLE} -m glad ${GLAD_ARGS}
-        COMMAND echo Writing ${GLAD_ARGS_PATH}
-        COMMAND echo ${GLAD_ARGS} > ${GLAD_ARGS_PATH}
-        WORKING_DIRECTORY $<$<BOOL:${GLAD_SOURCES_DIR}>:${GLAD_SOURCES_DIR}>
-        COMMENT "${TARGET}-generate"
-        USES_TERMINAL
-        )
+    if(GLAD_LANGUAGE STREQUAL "fortran")
+        add_custom_command(
+            OUTPUT ${GLAD_FILES} ${GLAD_ARGS_PATH}
+            COMMAND echo Cleaning ${GLAD_DIR}
+            COMMAND ${CMAKE_COMMAND} -E remove_directory ${GLAD_DIR}
+            COMMAND ${CMAKE_COMMAND} -E make_directory   ${GLAD_DIR}
+            COMMAND ${CMAKE_COMMAND} -E make_directory   ${GLAD_DIR}/mod
+            COMMAND echo Generating with args ${GLAD_ARGS}
+            COMMAND ${Python_EXECUTABLE} -m glad ${GLAD_ARGS}
+            COMMAND echo Writing ${GLAD_ARGS_PATH}
+            COMMAND echo ${GLAD_ARGS} > ${GLAD_ARGS_PATH}
+            WORKING_DIRECTORY $<$<BOOL:${GLAD_SOURCES_DIR}>:${GLAD_SOURCES_DIR}>
+            COMMENT "${TARGET}-generate"
+            USES_TERMINAL
+            )
+    else()
+        add_custom_command(
+            OUTPUT ${GLAD_FILES} ${GLAD_ARGS_PATH}
+            COMMAND echo Cleaning ${GLAD_DIR}
+            COMMAND ${CMAKE_COMMAND} -E remove_directory ${GLAD_DIR}
+            COMMAND ${CMAKE_COMMAND} -E make_directory   ${GLAD_DIR}
+            COMMAND echo Generating with args ${GLAD_ARGS}
+            COMMAND ${Python_EXECUTABLE} -m glad ${GLAD_ARGS}
+            COMMAND echo Writing ${GLAD_ARGS_PATH}
+            COMMAND echo ${GLAD_ARGS} > ${GLAD_ARGS_PATH}
+            WORKING_DIRECTORY $<$<BOOL:${GLAD_SOURCES_DIR}>:${GLAD_SOURCES_DIR}>
+            COMMENT "${TARGET}-generate"
+            USES_TERMINAL
+            )
+    endif()
 
     set(GLAD_ADD_LIBRARY_ARGS "")
     if(GG_SHARED)
@@ -301,6 +318,7 @@ function(glad_add_library TARGET)
     endif()
 
     if(GLAD_LANGUAGE STREQUAL "fortran")
+
         add_library("${TARGET}" ${GLAD_ADD_LIBRARY_ARGS})
 
         set_target_properties("${TARGET}"
@@ -309,13 +327,17 @@ function(glad_add_library TARGET)
             Fortran_PREPROCESS ON
         )
 
-        target_sources("${TARGET}" PRIVATE ${GLAD_FILES})
-
         target_include_directories("${TARGET}"
             PUBLIC
             "${GLAD_DIR}/include"
-            "${GLAD_DIR}/mod"
         )
+
+        target_include_directories("${TARGET}"
+            INTERFACE
+            $<BUILD_INTERFACE:${GLAD_DIR}/mod>
+        )
+
+        target_sources("${TARGET}" PRIVATE ${GLAD_FILES})
     else()
         add_library("${TARGET}" ${GLAD_ADD_LIBRARY_ARGS} ${GLAD_FILES})
 
