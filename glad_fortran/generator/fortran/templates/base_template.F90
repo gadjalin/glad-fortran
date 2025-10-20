@@ -286,12 +286,12 @@ module gl
             type(c_ptr), intent(in) :: cptr
             character(len=:,kind=c_char), allocatable, intent(out) :: fstr
 
-            character(len=:,kind=c_char), dimension(:), pointer :: cstr
+            character(len=1,kind=c_char), dimension(:), pointer :: cstr
             integer :: i
 
             call c_f_pointer(cptr, cstr, [c_strlen(cptr)])
-            allocate(character(len=len(cstr)) :: fstr)
-            do i = 1,len(cstr)
+            allocate(character(len=size(cstr)) :: fstr)
+            do i = 1,size(cstr)
                 fstr(i:i) = cstr(i)
             end do
         end subroutine c_f_str
