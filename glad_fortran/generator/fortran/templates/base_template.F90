@@ -238,6 +238,9 @@ module gl
             {% endfor %}
             {% if command is returning %}
             {{ command|impl_return_type }} :: res
+            {% if command is requiring_int_result %}
+            {{ command|interface_return_type}} :: int_res
+            {% endif %}
             {% endif %}
 
             {% for param in command.params %}
@@ -253,6 +256,9 @@ module gl
             {% endif %}
             {% endfor %}
             {% if command is returning %}
+            {% if command is requiring_int_result %}
+            int_res = {{ command.name|proc_pointer }}({{ command|int_arg_list }})
+            {% endif %}
             {{ command|format_result }}
             {% else %}
             call {{ command.name|proc_pointer }}({{ command|int_arg_list }})
@@ -281,20 +287,17 @@ module gl
         {% endfor %}
 
         ! Convert a C string (char*) to a Fortran character string
-        subroutine c_f_str(cptr, fstr)
+        subroutine c_f_strptr(cstrptr, fstrptr, nchars)
             implicit none
-            type(c_ptr), intent(in) :: cptr
-            character(len=:,kind=c_char), allocatable, intent(out) :: fstr
+            type(c_ptr), intent(in) :: cstrptr
+            character(len=:), pointer, intent(out) :: fstrptr
+            integer(kind=c_size_t),    intent(in)  :: nchars
 
-            character(len=1,kind=c_char), dimension(:), pointer :: cstr
-            integer :: i
+            character(len=nchars, kind=c_char), pointer :: cstrarray
 
-            call c_f_pointer(cptr, cstr, [c_strlen(cptr)])
-            allocate(character(len=size(cstr)) :: fstr)
-            do i = 1,size(cstr)
-                fstr(i:i) = cstr(i)
-            end do
-        end subroutine c_f_str
+            call c_f_pointer(cstrptr, cstrarray)
+            fstrptr => cstrarray
+        end subroutine c_f_strptr
 
         ! Create a (null-terminated) C string from a Fortran string
         pure function f_c_str(fstr) result(cstr)

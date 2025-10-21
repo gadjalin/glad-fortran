@@ -230,7 +230,7 @@ def impl_return_type(command):
     # not performance critical or anything
     # if parsed_type.type == 'GLubyte' and parsed_type.is_const and parsed_type.is_pointer == 1:
     if command.name in ['glGetString', 'glGetStringi']:
-        return 'character(len=:, kind=c_char), allocatable'
+        return 'character(len=:, kind=c_char), pointer'
     elif (parsed_type.is_pointer == 1 and is_void(parsed_type)) or \
          is_typedef_ptr(parsed_type):
         return 'type(c_ptr)'
@@ -306,6 +306,12 @@ def is_requiring_int_var(param):
 
     return is_char(parsed_type) and parsed_type.is_pointer == 2
 
+def is_requiring_int_result(command):
+    ret_type = command.proto.ret
+    parsed_type = get_parsed_type(ret_type)
+
+    return command.name in ('glGetString', 'glGetStringi')
+
 
 def intermediate_var(param):
     type_ = param.type
@@ -327,7 +333,7 @@ def int_var_pass(param):
     if is_char(parsed_type) and parsed_type.is_pointer == 2:
         return f'call f_c_strarray({arg_identifier(name)}, {int_identifier(name)}str, {int_identifier(name)})'
     else:
-        raise RuntimeError(f'Unhandled intermediate type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
+        raise NotImplementedError(f'Unhandled intermediate type: {parsed_type.type}{'*'*parsed_type.is_pointer}')
 
 
 # --- C Pointer arguments shown as Fortran optional arguments using intermediate
@@ -429,8 +435,7 @@ def format_result(command):
     parsed_type = get_parsed_type(ret_type)
 
     if command.name in ('glGetString', 'glGetStringi'):
-        return 'call c_f_str(' + proc_pointer(command.name) + \
-               '(' + int_arg_list(command) + ')' + ', res)'
+        return 'call c_f_strptr(int_res, res, c_strlen(int_res))'
     elif is_typedef_funptr(parsed_type):
         return 'call c_f_procpointer(' + proc_pointer(command.name) + \
                '(' + int_arg_list(command) + ')' + ', res)'
@@ -653,6 +658,7 @@ class FortranGenerator(JinjaGenerator):
         self.environment.tests.update(
             returning=is_returning,
             requiring_int_var=is_requiring_int_var,
+            requiring_int_result=is_requiring_int_result,
             optional=is_optional
         )
 
